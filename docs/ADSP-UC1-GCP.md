@@ -1,6 +1,6 @@
 # Deploy Use-Case 1 in Google Cloud
 
-This document provides complete instructions for deploying Application Security and Delivery Portfolio (ADSP) Use-Case 1 in Google Cloud Platform.
+This document provides complete instructions for deploying F5 Application Security and Delivery Portfolio (ADSP) Use-Case 1 in Google Cloud Platform.
 
 ---
 

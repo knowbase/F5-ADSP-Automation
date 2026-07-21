@@ -13,3 +13,6 @@ nginx:
   service:
     type: LoadBalancer
     externalTrafficPolicy: Local
+  config:
+    waf:
+      enable: true

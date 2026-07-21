@@ -1,18 +1,19 @@
 # Deploy Use-Case 4 in Google Cloud
 
-This document provides complete instructions for deploying Application Security and Delivery Portfolio (ADSP) Use-Case 4 in Google Cloud Platform.
+This document provides complete instructions for deploying F5 Application Security and Delivery Portfolio (ADSP) Use-Case 4 in Google Cloud Platform.
 
 ---
 
 ## Overview
 
-Use-Case 4 deploys **NGINX Gateway Fabric (NGF)** on the Kubernetes Gateway API. NAP is not used; WAF and API protection are provided entirely by F5 Distributed Cloud at the edge.
+Use-Case 4 deploys **NGINX Gateway Fabric (NGF)** on the Kubernetes Gateway API, with **F5 WAF for NGINX** running in-cluster underneath F5 Distributed Cloud's edge protection - the same layered, defense-in-depth posture as UC2, built on the Gateway API instead of NIC.
 
 This repository deploys a Kubernetes-based application delivery demonstration consisting of:
 
 - **Network Infrastructure** - VPC with a dedicated `k8s` subnet (with secondary ranges for pods and services), management subnet, and NAT for private nodes
 - **GKE Standard Cluster** - zonal cluster with private nodes, public control plane locked down by authorized networks, Dataplane V2, Workload Identity, shielded nodes
-- **F5 NGINX Gateway Fabric (NGF)** running **NGINX Plus**, installed via the `oci://ghcr.io/nginx/charts/nginx-gateway-fabric` chart. The control plane provisions an NGINX data plane `Deployment` and a `Service` of type `LoadBalancer` when the `Gateway` is created.
+- **F5 NGINX Gateway Fabric (NGF)** running **NGINX Plus with F5 WAF for NGINX**, installed via the `oci://ghcr.io/nginx/charts/nginx-gateway-fabric` chart. The control plane provisions an NGINX data plane `Deployment` and a `Service` of type `LoadBalancer` when the `Gateway` is created.
+- **F5 WAF for NGINX** - a Gateway-level `WAFPolicy` attaches a compiled policy bundle to the NGF `Gateway`, protecting every route behind it
 - **Application Workload** - `comfy-capybara` deployed via the `oci://ghcr.io/knowbase/charts/comfy-capybara` Helm chart, exposed through a Gateway API `HTTPRoute` attached to the NGF `Gateway`
 - **F5 Distributed Cloud (XC)** - HTTPS LoadBalancer with WAF and API protection (validation report, fall-through report) fronting the NGF data plane; origin auto-discovered from the data plane LoadBalancer IP via remote state
 
@@ -34,7 +35,8 @@ The GitHub Actions workflow deploys modules sequentially with dependencies:
    ↓
 3. Terraform: GKE (Standard zonal cluster, private nodes, authorized networks)
    ↓
-4. Terraform: NGF (Gateway API CRDs, NGF control plane Helm release, Gateway)
+4. Terraform: NGF (Workflow: compile WAF policy → upload to GCS → sign URL;
+                    Gateway API CRDs, NGF control plane Helm release (WAF-enabled image), Gateway, WAFPolicy)
    ↓
 5. Terraform: App (helm_release of comfy-capybara; emits a Gateway API HTTPRoute)
    ↓
@@ -51,6 +53,12 @@ The GitHub Actions workflow deploys modules sequentially with dependencies:
 **API Protection Flow:**
 - OpenAPI spec at `config/uc4/app/oas/openapi.json` is uploaded by the workflow to the XC object store via the stored-objects API and referenced by the `volterra_api_definition` resource
 - The `volterra_http_loadbalancer` attaches the api_definition with validation active in report mode and fall-through in report mode by default
+
+**WAF Policy Flow:**
+- Policy source at `config/uc4/nap/policy.json` is compiled by the workflow (`private-registry.nginx.com/nap/waf-compiler`) into `/tmp/compiled_policy.tgz`
+- The compiled bundle is uploaded to `gs://<state-bucket>/artifacts/uc4/waf/compiled_policy.tgz` (private, never public)
+- The workflow generates a short-lived GCS v4 signed URL for that object and passes it to Terraform as `waf_bundle_url`
+- The `WAFPolicy` resource (Gateway-level `targetRefs`, bundle polling off) fetches the bundle once per apply via that signed URL - it doesn't need to stay valid any longer than the fetch itself
 
 Destroy operations run in reverse order: `XC → App → NGF → GKE → Infra → State Bucket`. The infra destroy job sweeps any GKE-managed `k8s-*` / `gke-*` LoadBalancer firewall rules left attached to the VPC before deleting the network.
 
@@ -100,15 +108,39 @@ The runtime SA referenced by `k8s.gcp_runtime_service_account_email` in `config/
 
 UC4 does not mount anything from GCS into the data plane, so no Workload Identity binding for a bundle reader is required.
 
-### F5 NGINX Plus Requirements
+#### Pre-stage self-impersonation binding for signed WAF bundle URLs (one-time per project)
 
-The NGF NGINX Plus data plane image comes from `private-registry.nginx.com`, which requires a valid NGINX Plus subscription:
+The deploy SA generates a short-lived GCS v4 signed URL for the compiled WAF policy bundle (`gcloud storage sign-url --impersonate-service-account`). The IAM Credentials API requires the caller to hold `serviceAccountTokenCreator` on the target SA even when the caller's own identity *is* that SA - bind it once:
+
+```bash
+gcloud iam service-accounts add-iam-policy-binding "${GCP_SERVICE_ACCOUNT}" \
+  --member="serviceAccount:${GCP_SERVICE_ACCOUNT}" \
+  --role="roles/iam.serviceAccountTokenCreator"
+```
+
+This only lets the deploy SA mint short-lived tokens/signed blobs *as itself* - not impersonate any other identity - and since the SA already holds `roles/storage.admin` (direct read/write/delete on the same bucket), this doesn't widen blast radius. For least-privilege, bind a custom role containing only `iam.serviceAccounts.signBlob` instead of the full predefined role:
+
+```bash
+gcloud iam roles create waf_bundle_signer --project="${PROJECT_ID}" \
+  --title="WAF bundle signBlob" \
+  --permissions="iam.serviceAccounts.signBlob"
+
+gcloud iam service-accounts add-iam-policy-binding "${GCP_SERVICE_ACCOUNT}" \
+  --member="serviceAccount:${GCP_SERVICE_ACCOUNT}" \
+  --role="projects/${PROJECT_ID}/roles/waf_bundle_signer"
+```
+
+This permission is granted at the service-account resource level, not per-object/per-bucket - there's no finer-grained way to scope it to just the WAF bundle object.
+
+### F5 NGINX Plus + F5 WAF for NGINX Requirements
+
+The NGF NGINX Plus data plane image and the WAF compiler come from `private-registry.nginx.com`, which requires a valid NGINX Plus subscription **and** an F5 WAF for NGINX entitlement:
 
 1. **NGINX JWT Token** - from MyF5 portal, used for the license (`nplus-license`) secret and as the registry username
 2. **NGINX Repository Client Certificate** - `nginx-repo.crt` from the subscription bundle
 3. **NGINX Repository Client Key** - `nginx-repo.key` from the subscription bundle
 
-The cluster pulls the Plus data plane image directly using the `nginx-plus-registry-secret` (dockerconfigjson) that Terraform creates from `NGINX_JWT`; the NGF control plane image is public (`ghcr.io`).
+The cluster pulls the WAF-enabled Plus data plane image (`nginx-plus-f5waf`) directly using the `nginx-plus-registry-secret` (dockerconfigjson) that Terraform creates from `NGINX_JWT`; the NGF control plane image is public (`ghcr.io`). The workflow additionally uses `NGINX_REPO_CRT`/`NGINX_REPO_KEY` to authenticate a local `docker run` of the WAF policy compiler on the runner - the same certificate/key pair, just used outside the cluster.
 
 ### F5 Distributed Cloud (XC) Requirements
 
@@ -295,6 +327,7 @@ F5-ADSP-Automation/
 │   │   └── gcp/env.json             # Shared GCP settings
 │   └── uc4/
 │       ├── gcp/env.json             # UC4 GCP + GKE + NGF config
+│       ├── nap/policy.json          # WAF policy source (compiled in workflow)
 │       ├── app/
 │       │   ├── env.json             # comfy-capybara chart + route config
 │       │   └── oas/openapi.json     # OpenAPI spec for the app (you drop this)
@@ -302,7 +335,7 @@ F5-ADSP-Automation/
 ├── infra/gcp/                       # Network infrastructure
 ├── k8s/gcp/                         # GKE Standard cluster
 ├── f5/
-│   ├── ngf/gcp/                     # NGINX Gateway Fabric (NGINX Plus) + Gateway
+│   ├── ngf/gcp/                     # NGINX Gateway Fabric (NGINX Plus + WAF) + Gateway + WAFPolicy
 │   └── xc/                          # F5 Distributed Cloud (shared module)
 ├── app/gcp/                         # comfy-capybara helm_release + HTTPRoute
 └── docs/
@@ -315,9 +348,11 @@ Remote state is stored in GCS bucket `${project_prefix}-state-bucket`:
 
 - `state/uc4/infra/` - VPC, subnets, firewall rules
 - `state/uc4/k8s/` - GKE cluster + node pool
-- `state/uc4/ngf/` - Gateway API CRDs, NGF control plane Helm release, Gateway, secrets
+- `state/uc4/ngf/` - Gateway API CRDs, NGF control plane Helm release, Gateway, WAFPolicy, secrets
 - `state/uc4/app/` - comfy-capybara Helm release, namespace, HTTPRoute
 - `state/uc4/xc/` - XC namespace, HTTP LoadBalancer, WAF policy, api_definition
+
+Compiled artifacts live outside Terraform state at `artifacts/uc4/waf/compiled_policy.tgz` in the same state bucket - a private object, never public, fetched via a short-lived signed URL generated fresh on each deploy.
 
 ---
 
@@ -374,9 +409,11 @@ Edit `config/uc4/gcp/env.json`:
     "namespace": "nginx-gateway",
     "chart_version": "2.6.4",
     "gatewayclass_name": "nginx",
-    "nginx_plus_image_repository": "private-registry.nginx.com/nginx-gateway-fabric/nginx-plus",
+    "nginx_plus_image_repository": "private-registry.nginx.com/nginx-gateway-fabric/nginx-plus-f5waf",
     "nginx_plus_image_tag": "2.6.4",
-    "gateway_api_crds_url": "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml"
+    "gateway_api_crds_url": "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml",
+    "waf_policy_name": "waf-policy",
+    "waf_compiler_tag": "5.13.2"
   }
 }
 ```
@@ -394,8 +431,11 @@ Edit `config/uc4/gcp/env.json`:
 
 **Customizable Settings (`ngf` block):**
 - `chart_version` / `nginx_plus_image_tag` - pin specific NGF versions (keep them aligned)
+- `nginx_plus_image_repository` - must stay the `-f5waf` variant; the plain `nginx-plus` repo has no WAF sidecars
 - `gateway_api_crds_url` - the upstream Gateway API standard-channel CRDs. The version must match what the chart version supports (NGF 2.6.4 → Gateway API v1.5.1).
 - `gatewayclass_name` - the GatewayClass the chart creates and the Gateway references
+- `waf_policy_name` - name of the `WAFPolicy` resource attached to the Gateway
+- `waf_compiler_tag` - must match whatever F5 WAF for NGINX version ships inside your pinned `nginx_plus_image_tag`; check NGF's release notes/compatibility matrix before changing either independently
 
 **Do Not Modify:**
 - `features.gke: true` / `features.k8s_ingress: true` - required for UC4. `k8s_ingress` opens the GKE data-plane LoadBalancer ports (80/443) to admin + XC origin ranges.
@@ -431,7 +471,24 @@ Edit `config/uc4/app/env.json`:
 **Do Not Modify:**
 - `route_type: "httproute"` - selects the Gateway API `HTTPRoute` path of the shared app module. `virtualserver` is the UC2 (NIC) path.
 
-### Step 4: Configure OpenAPI Spec
+### Step 4: Configure WAF Policy
+
+Edit `config/uc4/nap/policy.json`. The default is a baseline blocking policy on the NGINX template:
+
+```json
+{
+  "policy": {
+    "name": "uc4-baseline",
+    "template": { "name": "POLICY_TEMPLATE_NGINX_BASE" },
+    "applicationLanguage": "utf-8",
+    "enforcementMode": "blocking"
+  }
+}
+```
+
+The workflow runs `private-registry.nginx.com/nap/waf-compiler:<waf_compiler_tag>` against this file to produce `/tmp/compiled_policy.tgz`, uploads it privately to the state bucket, and signs a short-lived URL for the `WAFPolicy` resource to fetch it from. If you change the compiler tag, keep it matched to whatever F5 WAF for NGINX version ships inside `nginx_plus_image_tag` in `config/uc4/gcp/env.json`.
+
+### Step 5: Configure OpenAPI Spec
 
 Drop the OpenAPI spec for the app at one of:
 - `config/uc4/app/oas/openapi.json`
@@ -442,7 +499,7 @@ The workflow uploads the file to the XC object store (`stored_objects/swagger/uc
 
 The spec must be valid OpenAPI 3.x. Postman collections and raw Swagger 1.x are not accepted.
 
-### Step 5: Configure F5 XC Settings
+### Step 6: Configure F5 XC Settings
 
 Edit `config/uc4/xc/env.json`:
 
@@ -494,6 +551,7 @@ Edit `config/uc4/xc/env.json`:
 2. **Configure files:**
    - `config/common/gcp/env.json`
    - `config/uc4/gcp/env.json`
+   - `config/uc4/nap/policy.json`
    - `config/uc4/app/env.json`
    - `config/uc4/app/oas/openapi.json` (or `.yaml` / `.yml`)
    - `config/uc4/xc/env.json`
@@ -536,7 +594,7 @@ git push origin destroy-adsp-uc4
 Destroy sequence:
 1. F5 XC resources (HTTP LB, WAF, namespace)
 2. Application workload (comfy-capybara Helm release + namespace + HTTPRoute)
-3. NGF control plane, Gateway, Gateway API CRDs
+3. NGF control plane, Gateway, WAFPolicy, Gateway API CRDs
 4. GKE cluster
 5. Network infrastructure (after sweeping orphaned GKE LoadBalancer firewall rules)
 6. GCS state bucket (including all history)
@@ -596,6 +654,8 @@ gcloud container clusters get-credentials "${CLUSTER_NAME}" \
 | `ngf_namespace` | ngf | Namespace hosting NGF and the Gateway |
 | `gateway_name` | ngf | Gateway name (apps reference it from HTTPRoute parentRefs) |
 | `k8s_ingress_external_ip` | ngf | NGF data plane LoadBalancer public IP (XC origin) |
+| `waf_policy_name` | ngf | Name of the `WAFPolicy` resource attached to the Gateway |
+| `waf_policy_namespace` | ngf | Namespace of the `WAFPolicy` resource |
 | `app_host` | app | FQDN routed by the `HTTPRoute` |
 | `app_namespace` | app | Namespace the comfy-capybara workload runs in |
 | `endpoint` | xc | XC application domain (public URL) |
@@ -627,12 +687,21 @@ kubectl -n "${NGF_NS}" get pods -o wide
 kubectl -n "${NGF_NS}" get svc
 kubectl -n "${NGF_NS}" get gateways
 kubectl -n "${NGF_NS}" get gatewayclasses
+kubectl -n "${NGF_NS}" get wafpolicies
 
 # Gateway should report PROGRAMMED=True and an address
 kubectl -n "${NGF_NS}" describe gateway
 
+# WAFPolicy should report an Accepted condition against the Gateway
+WAF_NAME=$(gcloud storage cat gs://${STATE_BUCKET}/state/uc4/ngf/default.tfstate | \
+  jq -r '.outputs.waf_policy_name.value')
+kubectl -n "${NGF_NS}" describe wafpolicy "${WAF_NAME}"
+
 # Tail control plane logs
 kubectl -n "${NGF_NS}" logs -l app.kubernetes.io/name=nginx-gateway-fabric --tail=100
+
+# Confirm the WAF-enabled image and its sidecars landed on the data plane pod
+kubectl -n "${NGF_NS}" get pods -o jsonpath='{.items[*].spec.containers[*].name}'
 ```
 
 ### Application Workload Status
@@ -668,9 +737,15 @@ curl "https://${APP_HOST}/api/healthz"
 
 Without a matching `Host` header the Gateway returns 404; that's expected.
 
-### XC WAF Smoke Test
+### WAF Policy Enforcement Smoke Test
 
-UC4 has no in-cluster WAF; protection is provided by XC. With `xc_waf_blocking: true`, XC blocks a SQLi-style probe at the edge:
+A SQLi-style probe sent directly to the NGF data plane (bypassing XC) should be blocked in-cluster by the Gateway-level `WAFPolicy`:
+
+```bash
+curl -i -H "Host: ${APP_HOST}" "http://${NGF_IP}/api/users?id=1%20OR%201=1"
+```
+
+XC WAF blocks the same probe again at the edge, independently, with `xc_waf_blocking: true`:
 
 ```bash
 curl -i "https://${APP_HOST}/api/users?id=1%20OR%201=1"
@@ -766,7 +841,42 @@ curl -i "https://${APP_HOST}/api/users?id=1%20OR%201=1"
 **Resolution:**
 - The `NGINX_REPO_CRT` / `NGINX_REPO_KEY` / `NGINX_JWT` secrets must match your active NGINX Plus subscription
 - Terraform creates `nginx-plus-registry-secret` and `nplus-license` in the `nginx-gateway` namespace from `NGINX_JWT`; confirm they exist: `kubectl -n nginx-gateway get secret`
-- Confirm `nginx_plus_image_tag` exists at `private-registry.nginx.com/nginx-gateway-fabric/nginx-plus`
+- Confirm `nginx_plus_image_tag` exists at `private-registry.nginx.com/nginx-gateway-fabric/nginx-plus-f5waf` (the `-f5waf` variant, not the plain `nginx-plus` repo)
+
+### WAF Compiler Failures
+
+**Error:** Workflow step `Compile WAF policy` exits non-zero
+
+**Resolution:**
+- The compiler image (`private-registry.nginx.com/nap/waf-compiler:<waf_compiler_tag>`) requires the same docker cert install step that the data-plane image uses
+- Run the compiler locally with the same policy.json to surface the schema error:
+  ```bash
+  docker run --rm \
+    -v "$(pwd)/config/uc4/nap:/policy:ro" \
+    -v "$(pwd):/output" \
+    private-registry.nginx.com/nap/waf-compiler:<waf_compiler_tag> \
+    -p /policy/policy.json -o /output/compiled_policy.tgz
+  ```
+- The compiler tag must match whatever F5 WAF for NGINX version ships inside `nginx_plus_image_tag` in `config/uc4/gcp/env.json` - don't assume a tag from a different NGF version or from UC2's NIC-based NAP setup carries over
+
+### WAFPolicy Not Attached / Bundle Fetch Fails
+
+**Error:** `kubectl -n nginx-gateway describe wafpolicy` shows no `Accepted` condition, or NGF control plane logs show a bundle fetch error
+
+**Resolution:**
+- Confirm the signed URL hadn't expired before the apply completed - the "Generate signed URL for WAF bundle" step signs for 1 hour, generated fresh right before the Terraform apply
+- Confirm the `roles/iam.serviceAccountTokenCreator` self-binding is in place on the deploy SA (see Prerequisites)
+- Confirm the `WAFPolicy` CRD is installed: `kubectl get crd wafpolicies.gateway.nginx.org`
+- Confirm `targetRefs` in the `WAFPolicy` resource matches the Gateway's actual name/namespace
+
+### Signed URL Generation Fails
+
+**Error:** Workflow step `Generate signed URL for WAF bundle` exits non-zero or produces an empty URL
+
+**Resolution:**
+- Confirm the `roles/iam.serviceAccountTokenCreator` (or the least-privilege `signBlob`-only custom role) self-binding exists on the deploy SA
+- Confirm the compiled bundle actually uploaded in the previous step: `gsutil ls gs://${TF_STATE_BUCKET}/artifacts/uc4/waf/`
+- Re-run `gcloud storage sign-url` locally with the same `--impersonate-service-account` flag to see the raw error
 
 ### Gateway Not Programmed / No Address
 
@@ -911,7 +1021,7 @@ Estimated monthly costs for `us-west1` region (as of 2026, defaults from `config
 | External IPs (NAT + NGF data plane LB) | Standard | 730 | ~$15 |
 | Network Egress | Variable | - | ~$10 |
 | **Total (GCP)** | | | **~$340/month** |
-| F5 NGINX Plus | - | - | Contact F5 Sales |
+| F5 NGINX Plus + F5 WAF for NGINX | - | - | Contact F5 Sales |
 | F5 Distributed Cloud | - | - | Contact F5 Sales |
 
 **Cost Reduction Options:**

@@ -244,9 +244,10 @@ jobs:
             namespace:                   (.ngf.namespace                   // "nginx-gateway"),
             chart_version:               (.ngf.chart_version               // "2.6.4"),
             gatewayclass_name:           (.ngf.gatewayclass_name           // "nginx"),
-            nginx_plus_image_repository: (.ngf.nginx_plus_image_repository // "private-registry.nginx.com/nginx-gateway-fabric/nginx-plus"),
+            nginx_plus_image_repository: (.ngf.nginx_plus_image_repository // "private-registry.nginx.com/nginx-gateway-fabric/nginx-plus-f5waf"),
             nginx_plus_image_tag:        (.ngf.nginx_plus_image_tag        // "2.6.4"),
-            gateway_api_crds_url:        (.ngf.gateway_api_crds_url        // "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml")
+            gateway_api_crds_url:        (.ngf.gateway_api_crds_url        // "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml"),
+            waf_policy_name:             (.ngf.waf_policy_name             // "waf-policy")
           }' "$COMMON" "$UC_GCP" > /tmp/ngf.tfvars.json
 
       - name: Auth to Google Cloud (WIF)
@@ -257,6 +258,60 @@ jobs:
 
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v3
+
+      - name: Install docker certs for private-registry.nginx.com
+        shell: bash
+        env:
+          NGINX_REPO_CRT: ${{ secrets.NGINX_REPO_CRT }}
+          NGINX_REPO_KEY: ${{ secrets.NGINX_REPO_KEY }}
+        run: |
+          set -euo pipefail
+          CERT_DIR=/etc/docker/certs.d/private-registry.nginx.com
+          sudo mkdir -p "$CERT_DIR"
+          printf '%s\n' "$NGINX_REPO_CRT" | sudo tee "$CERT_DIR/client.cert" >/dev/null
+          printf '%s\n' "$NGINX_REPO_KEY" | sudo tee "$CERT_DIR/client.key"  >/dev/null
+          sudo chmod 600 "$CERT_DIR/client.key"
+
+      - name: Compile WAF policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          UC_GCP="$GITHUB_WORKSPACE/config/uc4/gcp/env.json"
+          WAF_COMPILER_TAG=$(jq -r '.ngf.waf_compiler_tag // "5.13.2"' "$UC_GCP")
+          POLICY_SRC="$GITHUB_WORKSPACE/config/uc4/nap"
+          OUT_DIR=/tmp
+          docker run --rm \
+            -v "$POLICY_SRC:/policy:ro" \
+            -v "$OUT_DIR:/output" \
+            "private-registry.nginx.com/nap/waf-compiler:${WAF_COMPILER_TAG}" \
+            -p /policy/policy.json -o /output/compiled_policy.tgz
+          sudo chmod 644 "$OUT_DIR/compiled_policy.tgz"
+          ls -lh "$OUT_DIR/compiled_policy.tgz"
+
+      - name: Upload compiled WAF bundle to GCS
+        shell: bash
+        run: |
+          set -euo pipefail
+          gsutil cp /tmp/compiled_policy.tgz \
+            "gs://${TF_STATE_BUCKET}/artifacts/uc4/waf/compiled_policy.tgz"
+
+      - name: Generate signed URL for WAF bundle
+        shell: bash
+        env:
+          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          SIGN_OUTPUT=$(gcloud storage sign-url \
+            "gs://${TF_STATE_BUCKET}/artifacts/uc4/waf/compiled_policy.tgz" \
+            --impersonate-service-account="${GCP_SERVICE_ACCOUNT}" \
+            --duration=1h)
+          SIGNED_URL=$(sed -n 's/^signed_url: //p' <<<"$SIGN_OUTPUT")
+          if [ -z "$SIGNED_URL" ]; then
+            echo "Failed to parse signed URL from gcloud output" >&2
+            exit 1
+          fi
+          echo "::add-mask::${SIGNED_URL}"
+          echo "TF_VAR_waf_bundle_url=${SIGNED_URL}" >> "$GITHUB_ENV"
 
       - name: Allow runner IP through GKE control plane authorized networks
         if: github.ref == 'refs/heads/deploy-adsp-uc4'

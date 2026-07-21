@@ -24,3 +24,13 @@ output "gatewayclass_name" {
   value       = var.gatewayclass_name
   description = "GatewayClass backing the Gateway."
 }
+
+output "waf_policy_name" {
+  value       = var.waf_policy_name
+  description = "Name of the WAFPolicy resource attached to the Gateway."
+}
+
+output "waf_policy_namespace" {
+  value       = kubernetes_namespace.nginx_gateway.metadata[0].name
+  description = "Namespace of the WAFPolicy resource."
+}

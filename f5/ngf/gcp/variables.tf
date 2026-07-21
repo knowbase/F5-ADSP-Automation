@@ -52,8 +52,8 @@ variable "chart_version" {
 
 variable "nginx_plus_image_repository" {
   type        = string
-  default     = "private-registry.nginx.com/nginx-gateway-fabric/nginx-plus"
-  description = "Data plane image repository for NGINX Plus."
+  default     = "private-registry.nginx.com/nginx-gateway-fabric/nginx-plus-f5waf"
+  description = "Data plane image repository for NGINX Plus. Must be the -f5waf variant for the WAF sidecars to be available."
 }
 
 variable "nginx_plus_image_tag" {
@@ -72,4 +72,17 @@ variable "gateway_api_crds_url" {
   type        = string
   default     = "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml"
   description = "URL to the upstream Gateway API standard-channel CRDs. Version must match the one NGF supports."
+}
+
+variable "waf_policy_name" {
+  type        = string
+  default     = "waf-policy"
+  description = "Name of the WAFPolicy resource attached to the Gateway."
+}
+
+variable "waf_bundle_url" {
+  type        = string
+  default     = ""
+  sensitive   = true
+  description = "Signed HTTPS URL to the compiled WAF policy bundle (.tgz). Set via TF_VAR_waf_bundle_url by the deploy workflow; left empty on destroy."
 }
